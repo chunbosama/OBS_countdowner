@@ -294,6 +294,23 @@ struct Timer {
 			remaining_ms = ms;
 	}
 
+	/*
+	 * 属性面板每改一个字段（包括颜色、字体这种跟时长无关的）都会走 update，
+	 * 所以同步剩余时间的判据必须是「设定时长本身变了」，而不是「当前是不是空闲」。
+	 * 否则「停止」保留的剩余时间会被下一次改样式冲成满值。
+	 *
+	 * 运行中/暂停中只记下新的设定值，不动当前这轮倒数。
+	 */
+	void apply_duration(int64_t ms)
+	{
+		if (ms <= 0)
+			ms = 1000; /* 最小 1 秒 */
+		const bool changed = (ms != duration_ms);
+		duration_ms = ms;
+		if (changed && (state == kIdle || state == kFinished))
+			remaining_ms = ms;
+	}
+
 	void start(int64_t now_ns)
 	{
 		if (state == kRunning)
@@ -304,10 +321,17 @@ struct Timer {
 		state = kRunning;
 	}
 
+	/*
+	 * 注意 toggle / stop 里的 `!suspended`：
+	 * suspend() 之后 end_ns 就不再代表「真实的目标结束时刻」了（它在恢复时才会重建），
+	 * 此时拿 end_ns - now 去算会把冻结期间流逝的时间算进去。
+	 * 冻结中的剩余时间已经存在 remaining_ms 里，直接用就行。
+	 */
 	void toggle(int64_t now_ns)
 	{
 		if (state == kRunning) {
-			remaining_ms = ns_to_ms(end_ns - now_ns);
+			if (!suspended)
+				remaining_ms = ns_to_ms(end_ns - now_ns);
 			state = kPaused;
 		} else if (state == kPaused) {
 			end_ns = now_ns + ms_to_ns(remaining_ms);
@@ -317,7 +341,7 @@ struct Timer {
 
 	void stop(int64_t now_ns)
 	{
-		if (state == kRunning)
+		if (state == kRunning && !suspended)
 			remaining_ms = ns_to_ms(end_ns - now_ns);
 		state = kIdle;
 	}

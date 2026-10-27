@@ -314,6 +314,91 @@ static void test_remaining_fraction()
 	CHECK(cd::remaining_fraction(400000, 300000) == 1.0f); /* 超界夹到 1 */
 }
 
+static void test_actions_while_suspended()
+{
+	printf("[actions while suspended]\n");
+	const int64_t MS = 1000000LL;
+	const int64_t t0 = 1000000000LL;
+
+	/* 隐藏期间按「停止」：冻结的剩余时间不能被算掉 */
+	{
+		cd::Timer t;
+		t.start(t0);
+		t.advance(t0 + 10000 * MS); /* 剩 290 秒 */
+		t.suspend(t0 + 10000 * MS);
+		t.advance(t0 + 20000 * MS); /* 隐藏期间不推进 */
+		t.stop(t0 + 110000 * MS);   /* 隐藏 100 秒之后才按停止 */
+		CHECK(t.state == cd::kIdle);
+		CHECK(t.remaining_ms == 290000);
+	}
+
+	/* 隐藏期间按「暂停」：同理，不能把冻结期间流逝的时间算进去 */
+	{
+		cd::Timer t;
+		t.start(t0);
+		t.advance(t0 + 10000 * MS);
+		t.suspend(t0 + 10000 * MS);
+		t.toggle(t0 + 40000 * MS); /* 隐藏 30 秒后按暂停 */
+		CHECK(t.state == cd::kPaused);
+		CHECK(t.remaining_ms == 290000);
+	}
+
+	/* 隐藏期间暂停 → 恢复可见 → 继续：从冻结值接着走 */
+	{
+		cd::Timer t;
+		t.start(t0);
+		t.advance(t0 + 10000 * MS);
+		t.suspend(t0 + 10000 * MS);
+		t.toggle(t0 + 40000 * MS);
+		t.resume(t0 + 50000 * MS);
+		t.toggle(t0 + 50000 * MS);
+		t.advance(t0 + 51000 * MS);
+		CHECK(t.state == cd::kRunning);
+		CHECK(t.remaining_ms == 289000);
+	}
+}
+
+static void test_duration_apply()
+{
+	printf("[duration apply]\n");
+	const int64_t MS = 1000000LL;
+	const int64_t t0 = 1000000000LL;
+
+	cd::Timer t;
+	t.start(t0);
+	t.advance(t0 + 5000 * MS);
+	t.stop(t0 + 5000 * MS);
+	CHECK(t.state == cd::kIdle);
+	CHECK(t.remaining_ms == 295000);
+
+	/* 改颜色/字体这类 update 会带着同样的时长再走一遍：不能动剩余时间 */
+	t.apply_duration(300000);
+	CHECK(t.duration_ms == 300000);
+	CHECK(t.remaining_ms == 295000);
+
+	/* 时长真的变了才同步过去 */
+	t.apply_duration(60000);
+	CHECK(t.duration_ms == 60000);
+	CHECK(t.remaining_ms == 60000);
+
+	/* 运行中改时长：只记住设定值，不打断这一轮 */
+	t.reset();
+	CHECK(t.remaining_ms == 60000);
+	t.start(t0);
+	t.advance(t0 + 1000 * MS);
+	t.apply_duration(120000);
+	CHECK(t.duration_ms == 120000);
+	CHECK(t.remaining_ms == 59000);
+
+	/* 结束后改时长：下次开始用的是新值 */
+	t.advance(t0 + 200000 * MS);
+	CHECK(t.state == cd::kFinished);
+	t.apply_duration(30000);
+	CHECK(t.remaining_ms == 30000);
+	t.start(t0 + 200000 * MS);
+	CHECK(t.state == cd::kRunning);
+}
+
 int main()
 {
 	test_format();
@@ -325,7 +410,9 @@ int main()
 	test_finish_and_restart();
 	test_stop_keeps_remaining();
 	test_suspend_resume();
+	test_actions_while_suspended();
 	test_duration_change();
+	test_duration_apply();
 
 	if (g_failures == 0) {
 		printf("\nALL PASS\n");

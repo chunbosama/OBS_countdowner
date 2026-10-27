@@ -55,6 +55,52 @@ const int64_t kBlinkStepNs = 500000000LL;    /* 每 500ms 切换一次 */
 /* 数据结构                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/*
+ * 从互斥锁内拷出的一帧快照。
+ *
+ * 视频线程拿到它就可以放下锁去做 obs_source_update / 渲染这类慢操作；
+ * 而 UI 线程（属性面板）随时可能在锁内改写配置。
+ * 所以凡是「出了锁还要用」的字段都必须在这里有副本——包括 std::string：
+ * 一边赋新值一边读旧值是真实的数据竞争，不是理论问题。
+ */
+struct cd_snapshot {
+	int64_t remaining_ms = 0;
+	int64_t duration_ms = 0;
+	int state = cd::kIdle;
+	bool blink_on = true;
+	bool blink = false;
+	int format = cd::kFmtAuto;
+
+	int64_t color = 0;
+	int64_t end_color = 0;
+	int64_t outline_color = 0;
+	int64_t outline_size = 0;
+	bool outline = true;
+
+	std::string align;
+	std::string valign;
+	std::string font_face;
+	int64_t font_size = 0;
+	int64_t font_flags = 0;
+
+	int style = cd::kStyleDigits;
+	int64_t padding = 0;
+	int64_t card_radius = 0;
+	int64_t card_color = 0;
+	int64_t card_opacity = 0;
+	int64_t thickness = 0;
+	int64_t progress_color = 0;
+	int64_t track_color = 0;
+	int64_t track_opacity = 0;
+	bool show_ticks = false;
+
+	float progress = 1.0f; /* 剩余占比，环/条按它画长度 */
+	bool finished = false;
+
+	uint32_t width = 0;
+	uint32_t height = 0;
+};
+
 struct countdown {
 	obs_source_t *source = nullptr;
 	obs_source_t *text = nullptr;        /* 私有子源，负责真正绘制文字 */
@@ -106,35 +152,16 @@ struct countdown {
 	/* --- 渲染缓存 --- */
 	uint32_t width = 320;
 	uint32_t height = 120;
-	cd::Layout layout;    /* 版面：文字位置与装饰图元的位置 */
-	float progress = 1.0f; /* 剩余占比，环/条按它画长度 */
-	bool finished = false;
+	cd::Layout layout; /* 版面：文字位置与装饰图元的位置 */
+
+	/* video_tick 写、video_render 读（两者都在图形线程），
+	   这样渲染侧不必再去读那些会被 UI 线程改写的配置字段 */
+	cd_snapshot view;
 
 	obs_hotkey_id hotkeys[ACT_COUNT] = {(obs_hotkey_id)OBS_INVALID_HOTKEY_ID,
 					    (obs_hotkey_id)OBS_INVALID_HOTKEY_ID,
 					    (obs_hotkey_id)OBS_INVALID_HOTKEY_ID,
 					    (obs_hotkey_id)OBS_INVALID_HOTKEY_ID};
-};
-
-/* 从互斥锁内拷出的快照，避免持锁调用 libobs 的接口 */
-struct cd_snapshot {
-	int64_t remaining_ms;
-	int64_t duration_ms;
-	int state;
-	bool blink_on;
-	int format;
-	int64_t color;
-	int64_t end_color;
-	int64_t outline_color;
-	int64_t outline_size;
-	bool outline;
-	int style;
-	int64_t padding;
-	int64_t card_radius;
-	int64_t thickness;
-	bool show_ticks;
-	uint32_t width;
-	uint32_t height;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -186,23 +213,34 @@ static void take_snapshot(countdown *cd, cd_snapshot *out)
 	out->duration_ms = cd->timer.duration_ms;
 	out->state = cd->timer.state;
 	out->blink_on = cd->blink_on;
+	out->blink = cd->blink;
 	out->format = cd->format;
 	out->color = cd->color;
 	out->end_color = cd->end_color;
 	out->outline_color = cd->outline_color;
 	out->outline_size = cd->outline_size;
 	out->outline = cd->outline;
+	out->align = cd->align;
+	out->valign = cd->valign;
+	out->font_face = cd->font_face;
+	out->font_size = cd->font_size;
+	out->font_flags = cd->font_flags;
 	out->style = cd->style;
 	out->padding = cd->padding;
 	out->card_radius = cd->card_radius;
+	out->card_color = cd->card_color;
+	out->card_opacity = cd->card_opacity;
 	out->thickness = cd->thickness;
+	out->progress_color = cd->progress_color;
+	out->track_color = cd->track_color;
+	out->track_opacity = cd->track_opacity;
 	out->show_ticks = cd->show_ticks;
 	out->width = cd->width;
 	out->height = cd->height;
 
-	/* 环/条的进度每帧都要新，所以顺手写回实例（渲染线程与这里同线程） */
-	cd->progress = cd::remaining_fraction(cd->timer.remaining_ms, cd->timer.duration_ms);
-	cd->finished = (cd->timer.state == cd::kFinished);
+	/* 环/条的长度每帧都要新，所以每帧都算一次 */
+	out->progress = cd::remaining_fraction(cd->timer.remaining_ms, cd->timer.duration_ms);
+	out->finished = (cd->timer.state == cd::kFinished);
 }
 
 static void apply_text(countdown *cd, const cd_snapshot &snap)
@@ -211,7 +249,7 @@ static void apply_text(countdown *cd, const cd_snapshot &snap)
 	cd::format_display(snap.remaining_ms, (cd::Format)snap.format, buf, sizeof(buf));
 
 	bool use_end_color = (snap.state == cd::kFinished);
-	if (use_end_color && cd->blink)
+	if (use_end_color && snap.blink)
 		use_end_color = snap.blink_on;
 
 	obs_data_set_string(cd->text_settings, "text", buf);
@@ -221,13 +259,13 @@ static void apply_text(countdown *cd, const cd_snapshot &snap)
 	obs_data_set_int(cd->text_settings, "outline_size", snap.outline_size);
 	obs_data_set_int(cd->text_settings, "outline_opacity", 100);
 	obs_data_set_int(cd->text_settings, "opacity", 100);
-	obs_data_set_string(cd->text_settings, "align", cd->align.c_str());
-	obs_data_set_string(cd->text_settings, "valign", cd->valign.c_str());
+	obs_data_set_string(cd->text_settings, "align", snap.align.c_str());
+	obs_data_set_string(cd->text_settings, "valign", snap.valign.c_str());
 
 	obs_data_t *font = obs_data_create();
-	obs_data_set_string(font, "face", cd->font_face.c_str());
-	obs_data_set_int(font, "size", cd->font_size);
-	obs_data_set_int(font, "flags", cd->font_flags);
+	obs_data_set_string(font, "face", snap.font_face.c_str());
+	obs_data_set_int(font, "size", snap.font_size);
+	obs_data_set_int(font, "flags", snap.font_flags);
 	obs_data_set_string(font, "style", "Regular");
 	obs_data_set_obj(cd->text_settings, "font", font);
 	obs_data_release(font);
@@ -524,9 +562,10 @@ static void cd_update(void *data, obs_data_t *settings)
 
 	{
 		std::lock_guard<std::mutex> guard(cd->lock);
-		/* 只在空闲/结束态跟随新时长，运行中不打断当前倒数 */
-		cd->timer.set_duration(duration, cd->timer.state == cd::kIdle ||
-							     cd->timer.state == cd::kFinished);
+		/* 只有「设定时长本身变了」才同步到剩余时间。
+		   不能只看当前状态：改颜色、改字体都会走 update，
+		   按状态判断会把「停止」保留下来的剩余时间冲成满值。 */
+		cd->timer.apply_duration(duration);
 		cd->color = obs_data_get_int(settings, "color");
 		cd->end_color = obs_data_get_int(settings, "end_color");
 		cd->outline = obs_data_get_bool(settings, "outline");
@@ -600,7 +639,7 @@ static void cd_video_tick(void *data, float seconds)
 		need_apply = true;
 	}
 
-	cd_snapshot snap;
+	cd_snapshot &snap = cd->view;
 	take_snapshot(cd, &snap);
 	guard.unlock();
 
@@ -617,29 +656,31 @@ static void cd_video_render(void *data, gs_effect_t *effect)
 	if (!cd || !cd->text)
 		return;
 
+	/* 只读 video_tick 留下的快照，不碰那些会被 UI 线程改写的配置字段 */
+	const cd_snapshot &v = cd->view;
 	const cd::Layout &lay = cd->layout;
-	if (cd->style == cd::kStyleDigits || lay.width <= 0) {
+	if (v.style == cd::kStyleDigits || lay.width <= 0) {
 		obs_source_video_render(cd->text);
 		return;
 	}
 
 	/* 结束时进度也跟着换成结束色，跟数字保持一致 */
-	const int64_t fill_rgb = cd->finished ? cd->end_color : cd->progress_color;
+	const int64_t fill_rgb = v.finished ? v.end_color : v.progress_color;
 	const uint32_t fill = cddraw::pack(fill_rgb, 100);
-	const uint32_t track = cddraw::pack(cd->track_color, (int)cd->track_opacity);
+	const uint32_t track = cddraw::pack(v.track_color, (int)v.track_opacity);
 
 	cddraw::begin();
-	switch (cd->style) {
+	switch (v.style) {
 	case cd::kStyleCard:
 		cddraw::card(0, 0, lay.width, lay.height, lay.card_radius,
-			     cddraw::pack(cd->card_color, (int)cd->card_opacity));
+			     cddraw::pack(v.card_color, (int)v.card_opacity));
 		break;
 	case cd::kStyleRing:
 		cddraw::ring(lay.ring_cx, lay.ring_cy, lay.ring_radius, lay.ring_thickness,
-			     cd->progress, fill, track, cd->show_ticks ? 12 : 0);
+			     v.progress, fill, track, v.show_ticks ? 12 : 0);
 		break;
 	case cd::kStyleBar:
-		cddraw::bar(lay.bar_x, lay.bar_y, lay.bar_w, lay.bar_h, cd->progress, fill, track);
+		cddraw::bar(lay.bar_x, lay.bar_y, lay.bar_w, lay.bar_h, v.progress, fill, track);
 		break;
 	default:
 		break;
