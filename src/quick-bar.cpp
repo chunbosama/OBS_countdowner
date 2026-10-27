@@ -241,7 +241,8 @@ void QuickBar::rebuild(const std::vector<cdreg::Entry> &entries)
 void QuickBar::applyRow(Row &row, const cdreg::Entry &entry)
 {
 	char buf[64];
-	cd::format_time(entry.status.remaining_ms, entry.status.force_hours, buf, sizeof(buf));
+	cd::format_display(entry.status.remaining_ms, (cd::Format)entry.status.format, buf,
+			   sizeof(buf));
 
 	const QString name = QString::fromUtf8(entry.name.c_str());
 	row.title->setText(name);

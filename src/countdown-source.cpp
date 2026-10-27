@@ -10,6 +10,7 @@
 
 #include "countdown-source.h"
 #include "countdown-core.h"
+#include "countdown-draw.h"
 #include "countdown-registry.h"
 
 #include <obs-module.h>
@@ -61,20 +62,33 @@ struct countdown {
 
 	std::mutex lock;
 
-	/* --- 用户配置 --- */
+	/* --- 用户配置 ---
+	   颜色都是 OBS 的 0xBBGGRR 格式（低字节是 R），和属性面板取色器保持一致 */
 	int64_t color = 0xFFFFFF;
-	int64_t end_color = 0xFF3B30;
+	int64_t end_color = 0x303BFF; /* #FF3B30 红 */
 	int64_t outline_color = 0x000000;
 	int64_t outline_size = 6;
 	bool outline = true;
 	bool blink = false;
-	bool force_hours = false;
+	int format = cd::kFmtAuto;
 	std::string align = "center";
 	std::string valign = "center";
 	std::string font_face = "Arial";
 	int64_t font_size = 96;
 	int64_t font_flags = 0;
 	std::string label; /* 实例标签，留空则用源名；只影响控制栏与提示 */
+
+	/* --- 外观样式（见 countdown-core.h 的 compute_layout） --- */
+	int style = cd::kStyleDigits;
+	int64_t padding = 24;
+	int64_t card_radius = 24;
+	int64_t card_color = 0x2A170F;   /* #0F172A */
+	int64_t card_opacity = 60;
+	int64_t thickness = 12;
+	int64_t progress_color = 0xF8BD38; /* #38BDF8 */
+	int64_t track_color = 0xFFFFFF;
+	int64_t track_opacity = 22;
+	bool show_ticks = false;
 
 	/* --- 运行时状态（时间与状态机都在 cd::Timer 里，单位换算不外泄） --- */
 	cd::Timer timer;
@@ -92,6 +106,9 @@ struct countdown {
 	/* --- 渲染缓存 --- */
 	uint32_t width = 320;
 	uint32_t height = 120;
+	cd::Layout layout;    /* 版面：文字位置与装饰图元的位置 */
+	float progress = 1.0f; /* 剩余占比，环/条按它画长度 */
+	bool finished = false;
 
 	obs_hotkey_id hotkeys[ACT_COUNT] = {(obs_hotkey_id)OBS_INVALID_HOTKEY_ID,
 					    (obs_hotkey_id)OBS_INVALID_HOTKEY_ID,
@@ -102,14 +119,20 @@ struct countdown {
 /* 从互斥锁内拷出的快照，避免持锁调用 libobs 的接口 */
 struct cd_snapshot {
 	int64_t remaining_ms;
+	int64_t duration_ms;
 	int state;
 	bool blink_on;
-	bool force_hours;
+	int format;
 	int64_t color;
 	int64_t end_color;
 	int64_t outline_color;
 	int64_t outline_size;
 	bool outline;
+	int style;
+	int64_t padding;
+	int64_t card_radius;
+	int64_t thickness;
+	bool show_ticks;
 	uint32_t width;
 	uint32_t height;
 };
@@ -160,22 +183,32 @@ static const char *state_text(cd::State state)
 static void take_snapshot(countdown *cd, cd_snapshot *out)
 {
 	out->remaining_ms = cd->timer.remaining_ms;
+	out->duration_ms = cd->timer.duration_ms;
 	out->state = cd->timer.state;
 	out->blink_on = cd->blink_on;
-	out->force_hours = cd->force_hours;
+	out->format = cd->format;
 	out->color = cd->color;
 	out->end_color = cd->end_color;
 	out->outline_color = cd->outline_color;
 	out->outline_size = cd->outline_size;
 	out->outline = cd->outline;
+	out->style = cd->style;
+	out->padding = cd->padding;
+	out->card_radius = cd->card_radius;
+	out->thickness = cd->thickness;
+	out->show_ticks = cd->show_ticks;
 	out->width = cd->width;
 	out->height = cd->height;
+
+	/* 环/条的进度每帧都要新，所以顺手写回实例（渲染线程与这里同线程） */
+	cd->progress = cd::remaining_fraction(cd->timer.remaining_ms, cd->timer.duration_ms);
+	cd->finished = (cd->timer.state == cd::kFinished);
 }
 
 static void apply_text(countdown *cd, const cd_snapshot &snap)
 {
 	char buf[64];
-	cd::format_time(snap.remaining_ms, snap.force_hours, buf, sizeof(buf));
+	cd::format_display(snap.remaining_ms, (cd::Format)snap.format, buf, sizeof(buf));
 
 	bool use_end_color = (snap.state == cd::kFinished);
 	if (use_end_color && cd->blink)
@@ -202,10 +235,22 @@ static void apply_text(countdown *cd, const cd_snapshot &snap)
 	obs_source_update(cd->text, cd->text_settings);
 
 	/* 文本源在渲染前宽高可能还是 0，给个兜底值免得画面里选不中 */
-	const uint32_t w = obs_source_get_width(cd->text);
-	const uint32_t h = obs_source_get_height(cd->text);
-	cd->width = w ? w : 320;
-	cd->height = h ? h : 120;
+	const uint32_t raw_w = obs_source_get_width(cd->text);
+	const uint32_t raw_h = obs_source_get_height(cd->text);
+
+	/* 装饰图元都摆在文字外面，所以整源尺寸要由版面算，而不是直接用文字尺寸 */
+	cd::StyleParams params;
+	params.style = snap.style;
+	params.padding = (int)snap.padding;
+	params.radius = (int)snap.card_radius;
+	params.thickness = (int)snap.thickness;
+	params.ticks = snap.show_ticks ? 12 : 0;
+
+	const cd::Layout lay = cd::compute_layout(params, raw_w ? (int)raw_w : 320,
+						  raw_h ? (int)raw_h : 120);
+	cd->layout = lay;
+	cd->width = (uint32_t)(lay.width > 0 ? lay.width : 320);
+	cd->height = (uint32_t)(lay.height > 0 ? lay.height : 120);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -281,7 +326,7 @@ static void report_status(countdown *cd)
 		std::lock_guard<std::mutex> guard(cd->lock);
 		status.state = cd->timer.state;
 		status.suspended = cd->timer.suspended;
-		status.force_hours = cd->force_hours;
+		status.format = cd->format;
 		status.remaining_ms = cd->timer.remaining_ms;
 		status.duration_ms = cd->timer.duration_ms;
 		label = cd->label;
@@ -459,6 +504,24 @@ static void cd_update(void *data, obs_data_t *settings)
 		obs_data_release(font);
 	}
 
+	/* 显示格式：老场景集合里没有 format 键，按 0.2.x 的「始终显示小时」迁移一次。
+	   写回 settings 是为了让下拉框显示的值和实际生效的一致。 */
+	int format = (int)cd::kFmtAuto;
+	if (obs_data_has_user_value(settings, "format")) {
+		format = (int)cd::format_from_id(obs_data_get_string(settings, "format"));
+	} else if (obs_data_get_bool(settings, "force_hours")) {
+		format = (int)cd::kFmtHours;
+		obs_data_set_string(settings, "format", cd::format_id(cd::kFmtHours));
+		obs_data_set_bool(settings, "force_hours", false);
+	}
+
+	const int style = (int)cd::style_from_id(obs_data_get_string(settings, "style"));
+
+	/* 0.2.x 的「结束红」写成了 0xFF3B30，但 OBS 颜色是 0xBBGGRR 字节序，
+	   那个值实际渲染出来是蓝紫色。老场景集合里还是这个旧默认值的话顺手迁成真红。 */
+	if (obs_data_get_int(settings, "end_color") == 0xFF3B30)
+		obs_data_set_int(settings, "end_color", 0x303BFF);
+
 	{
 		std::lock_guard<std::mutex> guard(cd->lock);
 		/* 只在空闲/结束态跟随新时长，运行中不打断当前倒数 */
@@ -470,12 +533,23 @@ static void cd_update(void *data, obs_data_t *settings)
 		cd->outline_color = obs_data_get_int(settings, "outline_color");
 		cd->outline_size = obs_data_get_int(settings, "outline_size");
 		cd->blink = obs_data_get_bool(settings, "blink");
-		cd->force_hours = obs_data_get_bool(settings, "force_hours");
+		cd->format = format;
 		cd->align = obs_data_get_string(settings, "align");
 		cd->valign = obs_data_get_string(settings, "valign");
 		cd->font_face = face;
 		cd->font_size = font_size;
 		cd->font_flags = font_flags;
+
+		cd->style = style;
+		cd->padding = obs_data_get_int(settings, "padding");
+		cd->card_radius = obs_data_get_int(settings, "card_radius");
+		cd->card_color = obs_data_get_int(settings, "card_color");
+		cd->card_opacity = obs_data_get_int(settings, "card_opacity");
+		cd->thickness = obs_data_get_int(settings, "thickness");
+		cd->progress_color = obs_data_get_int(settings, "progress_color");
+		cd->track_color = obs_data_get_int(settings, "track_color");
+		cd->track_opacity = obs_data_get_int(settings, "track_opacity");
+		cd->show_ticks = obs_data_get_bool(settings, "show_ticks");
 
 		const char *label = obs_data_get_string(settings, "label");
 		cd->label = label ? label : "";
@@ -540,8 +614,43 @@ static void cd_video_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	auto *cd = static_cast<countdown *>(data);
-	if (cd && cd->text)
+	if (!cd || !cd->text)
+		return;
+
+	const cd::Layout &lay = cd->layout;
+	if (cd->style == cd::kStyleDigits || lay.width <= 0) {
 		obs_source_video_render(cd->text);
+		return;
+	}
+
+	/* 结束时进度也跟着换成结束色，跟数字保持一致 */
+	const int64_t fill_rgb = cd->finished ? cd->end_color : cd->progress_color;
+	const uint32_t fill = cddraw::pack(fill_rgb, 100);
+	const uint32_t track = cddraw::pack(cd->track_color, (int)cd->track_opacity);
+
+	cddraw::begin();
+	switch (cd->style) {
+	case cd::kStyleCard:
+		cddraw::card(0, 0, lay.width, lay.height, lay.card_radius,
+			     cddraw::pack(cd->card_color, (int)cd->card_opacity));
+		break;
+	case cd::kStyleRing:
+		cddraw::ring(lay.ring_cx, lay.ring_cy, lay.ring_radius, lay.ring_thickness,
+			     cd->progress, fill, track, cd->show_ticks ? 12 : 0);
+		break;
+	case cd::kStyleBar:
+		cddraw::bar(lay.bar_x, lay.bar_y, lay.bar_w, lay.bar_h, cd->progress, fill, track);
+		break;
+	default:
+		break;
+	}
+	cddraw::end();
+
+	/* 装饰画完再把文字叠上去：文字由内置文本子源绘制，只挪一下位置 */
+	gs_matrix_push();
+	gs_matrix_translate3f((float)lay.text_x, (float)lay.text_y, 0.0f);
+	obs_source_video_render(cd->text);
+	gs_matrix_pop();
 }
 
 /* 可见性变化时冻结 / 恢复计时。调用方必须已持有互斥锁。 */
@@ -645,14 +754,26 @@ static void cd_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "minutes", 5);
 	obs_data_set_default_int(settings, "seconds", 0);
 	obs_data_set_default_int(settings, "color", 0xFFFFFF);
-	obs_data_set_default_int(settings, "end_color", 0xFF3B30);
+	obs_data_set_default_int(settings, "end_color", 0x303BFF); /* #FF3B30：OBS 颜色是 BGR 字节序 */
 	obs_data_set_default_bool(settings, "outline", true);
 	obs_data_set_default_int(settings, "outline_color", 0x000000);
 	obs_data_set_default_int(settings, "outline_size", 6);
 	obs_data_set_default_bool(settings, "blink", false);
-	obs_data_set_default_bool(settings, "force_hours", false);
+	obs_data_set_default_string(settings, "format", "auto");
 	obs_data_set_default_string(settings, "align", "center");
 	obs_data_set_default_string(settings, "valign", "center");
+
+	/* 外观样式：默认等于 0.2.x 的纯数字，老场景集合升上来不会变样 */
+	obs_data_set_default_string(settings, "style", "digits");
+	obs_data_set_default_int(settings, "padding", 24);
+	obs_data_set_default_int(settings, "card_radius", 24);
+	obs_data_set_default_int(settings, "card_color", 0x2A170F);         /* #0F172A */
+	obs_data_set_default_int(settings, "card_opacity", 60);
+	obs_data_set_default_int(settings, "thickness", 12);
+	obs_data_set_default_int(settings, "progress_color", 0xF8BD38);     /* #38BDF8 */
+	obs_data_set_default_int(settings, "track_color", 0xFFFFFF);
+	obs_data_set_default_int(settings, "track_opacity", 22);
+	obs_data_set_default_bool(settings, "show_ticks", false);
 
 	obs_data_t *font = obs_data_create();
 	obs_data_set_string(font, "face", "Arial");
@@ -672,6 +793,39 @@ static void add_align_items(obs_properties_t *props, const char *name, const cha
 	obs_property_list_add_string(list, T_("Align.End"), horizontal ? "right" : "bottom");
 }
 
+/* 只留下当前样式用得上的参数，免得属性面板里全是无效项 */
+static void update_style_visibility(obs_properties_t *props, const char *style_id)
+{
+	const cd::Style style = cd::style_from_id(style_id);
+	const bool card = style == cd::kStyleCard;
+	const bool ring = style == cd::kStyleRing;
+	const bool bar = style == cd::kStyleBar;
+	const bool shape = ring || bar;
+
+	auto show = [props](const char *name, bool visible) {
+		obs_property_t *p = obs_properties_get(props, name);
+		if (p)
+			obs_property_set_visible(p, visible);
+	};
+
+	show("padding", style != cd::kStyleDigits);
+	show("card_radius", card);
+	show("card_color", card);
+	show("card_opacity", card);
+	show("thickness", shape);
+	show("progress_color", shape);
+	show("track_color", shape);
+	show("track_opacity", shape);
+	show("show_ticks", ring);
+}
+
+static bool on_style_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	update_style_visibility(props, obs_data_get_string(settings, "style"));
+	return true;
+}
+
 static obs_properties_t *cd_get_properties(void *data)
 {
 	auto *cd = static_cast<countdown *>(data);
@@ -684,9 +838,12 @@ static obs_properties_t *cd_get_properties(void *data)
 		cd::State state;
 		bool suspended;
 		int64_t duration_ms;
+		int format;
 		{
 			std::lock_guard<std::mutex> guard(cd->lock);
-			cd::format_time(cd->timer.remaining_ms, cd->force_hours, time_buf, sizeof(time_buf));
+			format = cd->format;
+			cd::format_display(cd->timer.remaining_ms, (cd::Format)format, time_buf,
+					   sizeof(time_buf));
 			state = cd->timer.state;
 			suspended = cd->timer.suspended;
 			duration_ms = cd->timer.duration_ms;
@@ -696,8 +853,19 @@ static obs_properties_t *cd_get_properties(void *data)
 									     : state_text(state);
 		char dur_buf[64];
 		cd::format_time(duration_ms, true, dur_buf, sizeof(dur_buf));
-		snprintf(status, sizeof(status), "%s · 剩余 %s · 设定 %s", state_name, time_buf,
-			 dur_buf);
+
+		/* 不用 "…%s…%" 这种格式串：语言文件里的 % 会被 ini 解析吞掉，
+		   所以分隔符和单位都写在代码里，ini 只提供单词。 */
+		std::string line = state_name;
+		line += " · ";
+		line += T_("Info.Remaining");
+		line += " ";
+		line += time_buf;
+		line += " · ";
+		line += T_("Info.Set");
+		line += " ";
+		line += dur_buf;
+		snprintf(status, sizeof(status), "%s", line.c_str());
 	} else {
 		snprintf(status, sizeof(status), "%s", T_("State.Idle"));
 	}
@@ -707,14 +875,41 @@ static obs_properties_t *cd_get_properties(void *data)
 	obs_properties_add_button(props, "action_stop", T_("Action.Stop"), on_button);
 	obs_properties_add_button(props, "action_reset", T_("Action.Reset"), on_button);
 
-	/* --- 时长 --- */
+	/* --- 时长与显示格式 --- */
 	obs_properties_add_text(props, "label", T_("Prop.Label"), OBS_TEXT_DEFAULT);
 	obs_properties_add_int(props, "hours", T_("Prop.Hours"), 0, 23, 1);
 	obs_properties_add_int(props, "minutes", T_("Prop.Minutes"), 0, 59, 1);
 	obs_properties_add_int(props, "seconds", T_("Prop.Seconds"), 0, 59, 1);
-	obs_properties_add_bool(props, "force_hours", T_("Prop.ForceHours"));
 
-	/* --- 样式 --- */
+	obs_property_t *format = obs_properties_add_list(props, "format", T_("Prop.Format"),
+							 OBS_COMBO_TYPE_LIST,
+							 OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(format, T_("Format.Auto"), "auto");
+	obs_property_list_add_string(format, T_("Format.Hours"), "hms");
+	obs_property_list_add_string(format, T_("Format.Chinese"), "chinese");
+	obs_property_list_add_string(format, T_("Format.Seconds"), "seconds");
+
+	/* --- 外观样式 --- */
+	obs_property_t *style = obs_properties_add_list(props, "style", T_("Prop.Style"),
+							OBS_COMBO_TYPE_LIST,
+							OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(style, T_("Style.Digits"), "digits");
+	obs_property_list_add_string(style, T_("Style.Card"), "card");
+	obs_property_list_add_string(style, T_("Style.Ring"), "ring");
+	obs_property_list_add_string(style, T_("Style.Bar"), "bar");
+	obs_property_set_modified_callback(style, on_style_modified);
+
+	obs_properties_add_int(props, "padding", T_("Prop.Padding"), 0, 200, 1);
+	obs_properties_add_int(props, "card_radius", T_("Prop.Radius"), 0, 300, 1);
+	obs_properties_add_color(props, "card_color", T_("Prop.CardColor"));
+	obs_properties_add_int_slider(props, "card_opacity", T_("Prop.CardOpacity"), 0, 100, 1);
+	obs_properties_add_int(props, "thickness", T_("Prop.Thickness"), 1, 80, 1);
+	obs_properties_add_color(props, "progress_color", T_("Prop.ProgressColor"));
+	obs_properties_add_color(props, "track_color", T_("Prop.TrackColor"));
+	obs_properties_add_int_slider(props, "track_opacity", T_("Prop.TrackOpacity"), 0, 100, 1);
+	obs_properties_add_bool(props, "show_ticks", T_("Prop.ShowTicks"));
+
+	/* --- 文字 --- */
 	obs_properties_add_font(props, "font", T_("Prop.Font"));
 	obs_properties_add_color(props, "color", T_("Prop.Color"));
 	obs_properties_add_color(props, "end_color", T_("Prop.EndColor"));
@@ -725,6 +920,9 @@ static obs_properties_t *cd_get_properties(void *data)
 
 	add_align_items(props, "align", T_("Prop.Align"), true);
 	add_align_items(props, "valign", T_("Prop.Valign"), false);
+
+	/* 按当前样式隐藏用不上的项，面板别一上来就一大坨 */
+	update_style_visibility(props, cd ? cd::style_id((cd::Style)cd->style) : "digits");
 
 	return props;
 }

@@ -31,7 +31,7 @@ enum Action : int {
 struct Status {
 	int state = 0; /* cd::State */
 	bool suspended = false;
-	bool force_hours = false;
+	int format = 0; /* cd::Format，控制栏按同一格式显示时间 */
 	int64_t remaining_ms = 0;
 	int64_t duration_ms = 0;
 };

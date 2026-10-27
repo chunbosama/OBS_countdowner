@@ -4,8 +4,8 @@
    修改版本号时记得同步 src/version.h 里的 PLUGIN_VERSION。 */
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,3,0,0
+ PRODUCTVERSION 0,3,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -18,12 +18,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "obs-countdown"
             VALUE "FileDescription", "Countdown source for OBS Studio"
-            VALUE "FileVersion", "0.2.0"
+            VALUE "FileVersion", "0.3.0"
             VALUE "InternalName", "obs-countdown"
             VALUE "LegalCopyright", "GPL-2.0"
             VALUE "OriginalFilename", "obs-countdown.dll"
             VALUE "ProductName", "obs-countdown"
-            VALUE "ProductVersion", "0.2.0"
+            VALUE "ProductVersion", "0.3.0"
         END
     END
     BLOCK "VarFileInfo"

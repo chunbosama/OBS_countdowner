@@ -198,9 +198,128 @@ static void test_duration_change()
 	CHECK(t2.remaining_ms == 120000);
 }
 
+static void test_display_format()
+{
+	printf("[display format]\n");
+
+	char buf[64];
+
+	cd::format_display(300000, cd::kFmtAuto, buf, sizeof(buf));
+	CHECK(strcmp(buf, "05:00") == 0);
+
+	cd::format_display(300000, cd::kFmtHours, buf, sizeof(buf));
+	CHECK(strcmp(buf, "00:05:00") == 0);
+
+	cd::format_display(300000, cd::kFmtChinese, buf, sizeof(buf));
+	CHECK(strcmp(buf, "5分00秒") == 0);
+
+	cd::format_display(5400000, cd::kFmtChinese, buf, sizeof(buf));
+	CHECK(strcmp(buf, "1时30分00秒") == 0);
+
+	cd::format_display(45000, cd::kFmtChinese, buf, sizeof(buf));
+	CHECK(strcmp(buf, "45秒") == 0);
+
+	cd::format_display(300000, cd::kFmtSeconds, buf, sizeof(buf));
+	CHECK(strcmp(buf, "300") == 0);
+
+	/* 向上取整仍然成立：剩 0.5 秒是 1 秒，走完是 0 */
+	cd::format_display(500, cd::kFmtSeconds, buf, sizeof(buf));
+	CHECK(strcmp(buf, "1") == 0);
+	cd::format_display(0, cd::kFmtSeconds, buf, sizeof(buf));
+	CHECK(strcmp(buf, "0") == 0);
+
+	/* id <-> 枚举互转，场景集合里存的是 id */
+	CHECK(cd::format_from_id(cd::format_id(cd::kFmtChinese)) == cd::kFmtChinese);
+	CHECK(cd::format_from_id("nonsense") == cd::kFmtAuto);
+	CHECK(cd::format_from_id(nullptr) == cd::kFmtAuto);
+}
+
+static void test_layout()
+{
+	printf("[style layout]\n");
+	const int TW = 300;
+	const int TH = 120;
+
+	/* 纯数字：源就是文字大小，不做任何偏移 */
+	{
+		cd::StyleParams p;
+		p.style = cd::kStyleDigits;
+		const cd::Layout l = cd::compute_layout(p, TW, TH);
+		CHECK(l.width == TW);
+		CHECK(l.height == TH);
+		CHECK(l.text_x == 0);
+		CHECK(l.text_y == 0);
+	}
+
+	/* 卡片：四周各留一个 padding，圆角不超过短边一半 */
+	{
+		cd::StyleParams p;
+		p.style = cd::kStyleCard;
+		p.padding = 20;
+		p.radius = 500; /* 故意给个超大值 */
+		const cd::Layout l = cd::compute_layout(p, TW, TH);
+		CHECK(l.width == TW + 40);
+		CHECK(l.height == TH + 40);
+		CHECK(l.text_x == 20);
+		CHECK(l.text_y == 20);
+		CHECK(l.card_radius == (TH + 40) / 2);
+	}
+
+	/* 圆环：正方形，文字居中，环整圈都在框内 */
+	{
+		cd::StyleParams p;
+		p.style = cd::kStyleRing;
+		p.padding = 20;
+		p.thickness = 12;
+		const cd::Layout l = cd::compute_layout(p, TW, TH);
+
+		CHECK(l.width == l.height);
+		CHECK(l.text_x == (l.width - TW) / 2);
+		CHECK(l.text_y == (l.height - TH) / 2);
+		CHECK(l.ring_cx == l.width / 2);
+		CHECK(l.ring_radius == l.width / 2 - 1 - l.ring_thickness / 2);
+
+		/* 环内缘必须包住文字的外接圆，四角才不会压到环 */
+		const double half_diag = sqrt((double)TW * TW + (double)TH * TH) / 2.0;
+		const int inner = l.ring_radius - l.ring_thickness / 2;
+		CHECK(inner >= (int)half_diag);
+	}
+
+	/* 进度条：宽度跟文字走，高度多出一条 bar */
+	{
+		cd::StyleParams p;
+		p.style = cd::kStyleBar;
+		p.padding = 20;
+		p.thickness = 10;
+		const cd::Layout l = cd::compute_layout(p, TW, TH);
+		CHECK(l.width == TW);
+		CHECK(l.height == TH + 10 + 10);
+		CHECK(l.bar_x == 0);
+		CHECK(l.bar_w == TW);
+		CHECK(l.bar_h == 10);
+		CHECK(l.bar_y == TH + 10);
+		/* 文字不能被条盖住 */
+		CHECK(l.bar_y >= l.text_y + TH);
+	}
+}
+
+static void test_remaining_fraction()
+{
+	printf("[remaining fraction]\n");
+	CHECK(cd::remaining_fraction(300000, 300000) == 1.0f);
+	CHECK(cd::remaining_fraction(150000, 300000) == 0.5f);
+	CHECK(cd::remaining_fraction(0, 300000) == 0.0f);
+	CHECK(cd::remaining_fraction(-100, 300000) == 0.0f);
+	CHECK(cd::remaining_fraction(500, 0) == 0.0f);       /* 时长为 0 不除零 */
+	CHECK(cd::remaining_fraction(400000, 300000) == 1.0f); /* 超界夹到 1 */
+}
+
 int main()
 {
 	test_format();
+	test_display_format();
+	test_layout();
+	test_remaining_fraction();
 	test_basic_flow();
 	test_pause_resume();
 	test_finish_and_restart();
